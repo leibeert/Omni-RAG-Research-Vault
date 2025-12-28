@@ -1,5 +1,6 @@
 from pathlib import Path
 from src.parser import PDFParser
+from src.database import Database
 
 def main():
     """
@@ -15,6 +16,7 @@ def main():
     print(f"Scanning {data_dir} for PDFs...")
     
     parser = PDFParser()
+    db = Database() # Initialize Database (Hybrid Search)
     
     pdf_files = list(data_dir.glob("*.pdf"))
     if not pdf_files:
@@ -24,9 +26,16 @@ def main():
     for pdf_file in pdf_files:
         print(f"Processing {pdf_file.name}...")
         try:
+            documents = []
             for document in parser.parse(pdf_file):
-                print(f"  - Extracted Page {document.page_number} (Hash: {document.metadata['id'][:8]}...)")
-                # Future: Ingest into vector DB here
+                print(f"  - Parsed Page {document.page_number}")
+                documents.append(document)
+            
+            if documents:
+                print(f"  > Indexing {len(documents)} pages into Vector DB & BM25...")
+                db.add_documents(documents)
+                print("  > Done.")
+                
         except Exception as e:
             print(f"  X Failed to process {pdf_file.name}: {e}")
 
