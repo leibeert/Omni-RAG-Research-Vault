@@ -9,12 +9,16 @@ import ollama
 from src.database import Database
 from src.search import Reranker, search_and_answer
 from src.config import TOP_K_RETRIEVAL, TOP_K_RERANK
+from src.memory import ChatHistory
 
 app = FastAPI(title="Omni-RAG Research Vault", version="1.0.0")
 
 # Initialize Global Resources
 db = Database()
 reranker = Reranker()
+# Simple in-memory history for single-user dev (Global)
+# In prod, this would be session-based or keyed by user_id
+chat_history = ChatHistory()
 
 class QueryRequest(BaseModel):
     query: str
@@ -37,7 +41,15 @@ async def chat_endpoint(request: QueryRequest):
     2. Reranks
     3. Streams response from Ollama
     """
-    query = request.query
+    user_query = request.query
+    
+    # 0. Conversation Memory - Condense Question
+    # Check if we have history
+    query = chat_history.condense_question(user_query)
+    print(f"Original: {user_query} -> Condensed: {query}")
+    
+    # Add user message to history
+    chat_history.add_user_message(user_query) # Store original or condensed? Usually original for display, but context matters.
     
     # 1. Retrieval & Reranking (Non-streaming part)
     # We reuse the logic from search.py but we need to control the generation generation for streaming
@@ -102,9 +114,14 @@ async def chat_endpoint(request: QueryRequest):
             stream=True,
         )
         
+        full_response = ""
         for chunk in stream:
             content = chunk['message']['content']
+            full_response += content
             yield content
+        
+        # Update History with full response
+        chat_history.add_ai_message(full_response)
             
         # Optional: Append sources to the stream in markdown
         yield "\n\n**Sources:**\n"
