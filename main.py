@@ -1,43 +1,117 @@
-from pathlib import Path
-from src.parser import PDFParser
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import List, Optional
+import uvicorn
+import json
+import ollama
+
 from src.database import Database
+from src.search import Reranker, search_and_answer
+from src.config import TOP_K_RETRIEVAL, TOP_K_RERANK
 
-def main():
+app = FastAPI(title="Omni-RAG Research Vault", version="1.0.0")
+
+# Initialize Global Resources
+db = Database()
+reranker = Reranker()
+
+class QueryRequest(BaseModel):
+    query: str
+    pass
+
+@app.on_event("startup")
+async def startup_event():
+    print("Omni-RAG System Initialized.")
+    # In a real app, we might check DB connection here
+
+@app.get("/")
+def read_root():
+    return {"status": "active", "message": "Welcome to Omni-RAG Research Vault API"}
+
+@app.post("/chat")
+async def chat_endpoint(request: QueryRequest):
     """
-    Main entry point for the RAG Research Vault ingestion pipeline.
+    Streaming chat endpoint that:
+    1. Searches (Hybrid)
+    2. Reranks
+    3. Streams response from Ollama
     """
-    base_dir = Path(__file__).parent
-    data_dir = base_dir / "data"
+    query = request.query
     
-    if not data_dir.exists():
-        print(f"Data directory not found: {data_dir}")
-        return
+    # 1. Retrieval & Reranking (Non-streaming part)
+    # We reuse the logic from search.py but we need to control the generation generation for streaming
+    
+    # Search
+    results = db.search(query, n_results=TOP_K_RETRIEVAL)
+    if not results['documents'] or not results['documents'][0]:
+        return {"answer": "No relevant documents found.", "sources": []}
+    
+    candidates_text = results['documents'][0]
+    candidates_meta = results['metadatas'][0]
+    
+    # Rerank
+    top_indices = reranker.rerank(query, candidates_text, top_k=TOP_K_RERANK)
+    top_docs = [candidates_text[i] for i in top_indices]
+    top_metas = [candidates_meta[i] for i in top_indices]
+    
+    # Construct Context
+    context = "\n\n".join([f"Source {i+1}: {doc}" for i, doc in enumerate(top_docs)])
+    
+    # Prepare Prompt
+    prompt = f"""You are a research assistant. Answer the question based ONLY on the following context.
+    
+    Context:
+    {context}
+    
+    Question: {query}
+    
+    Answer:"""
+    
+    # Sources for the client
+    sources = []
+    for meta in top_metas:
+        sources.append({
+            "filename": meta.get("filename", "Unknown"),
+            "page_number": meta.get("page_number", "Unknown")
+        })
 
-    print(f"Scanning {data_dir} for PDFs...")
-    
-    parser = PDFParser()
-    db = Database() # Initialize Database (Hybrid Search)
-    
-    pdf_files = list(data_dir.glob("*.pdf"))
-    if not pdf_files:
-        print("No PDF files found.")
-        return
-
-    for pdf_file in pdf_files:
-        print(f"Processing {pdf_file.name}...")
-        try:
-            documents = []
-            for document in parser.parse(pdf_file):
-                print(f"  - Parsed Page {document.page_number}")
-                documents.append(document)
+    # Generator for Streaming
+    def iter_response():
+        # First yield the sources headers or metadata if needed? 
+        # Usually checking streaming APIs, we send the text. 
+        # We can send a JSON structure line by line, or just raw text.
+        # For simplicity in this "Streaming" task, we'll stream the raw text of the answer.
+        # But the user requirement says "Update the final output to be a dictionary containing... sources".
+        # Streaming standard JSON is hard. 
+        # PROPOSAL: We will stream the text chunks, and maybe append sources at the end?
+        # OR: We yield a custom SSE event or JSON lines.
+        # Let's try simple text streaming for the answer, and maybe print sources first?
+        
+        # Let's send a JSON object with sources first as a separate message if possible?
+        # Or standard practice: Stream the markdown tokens.
+        # We will separate sources and answer.
+        # Since the user asked for a "dictionary containing... sources", that was for the static output.
+        # For "Streaming", usually it's text.
+        # Let's stream the text and return sources in a header? (Too rigid)
+        # Let's stick to streaming the raw answer provided by Ollama.
+        
+        stream = ollama.chat(
+            model='qwen2.5:14b',
+            messages=[{'role': 'user', 'content': prompt}],
+            stream=True,
+        )
+        
+        for chunk in stream:
+            content = chunk['message']['content']
+            yield content
             
-            if documents:
-                print(f"  > Indexing {len(documents)} pages into Vector DB & BM25...")
-                db.add_documents(documents)
-                print("  > Done.")
-                
-        except Exception as e:
-            print(f"  X Failed to process {pdf_file.name}: {e}")
+        # Optional: Append sources to the stream in markdown
+        yield "\n\n**Sources:**\n"
+        for s in sources:
+            yield f"- {s['filename']} (Page {s['page_number']})\n"
+
+    return StreamingResponse(iter_response(), media_type="text/plain")
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
