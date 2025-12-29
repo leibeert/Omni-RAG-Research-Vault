@@ -6,6 +6,11 @@ PROJECT_ROOT = os.path.dirname(BASE_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CHROMA_DB_PATH = os.path.join(DATA_DIR, "chroma_db")
 
+# Docker / Server Settings
+CHROMA_HOST = os.getenv("CHROMA_HOST", None)
+CHROMA_PORT = os.getenv("CHROMA_PORT", "8000")
+
+
 # Collection Settings
 COLLECTION_NAME = "research_vault"
 

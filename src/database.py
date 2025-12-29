@@ -5,7 +5,7 @@ from rank_bm25 import BM25Okapi
 import string
 
 from src.parser import Document
-from src.config import CHROMA_DB_PATH, COLLECTION_NAME, EMBEDDING_MODEL
+from src.config import CHROMA_DB_PATH, COLLECTION_NAME, EMBEDDING_MODEL, CHROMA_HOST, CHROMA_PORT
 
 class OllamaEmbeddingFunction(chromadb.EmbeddingFunction):
     """
@@ -26,7 +26,12 @@ class Database:
     Manages the vector store and keyword search index (Hybrid Search).
     """
     def __init__(self, persist_directory: str = CHROMA_DB_PATH, collection_name: str = COLLECTION_NAME):
-        self.client = chromadb.PersistentClient(path=persist_directory)
+        if CHROMA_HOST:
+            print(f"Connecting to ChromaDB Server at {CHROMA_HOST}:{CHROMA_PORT}...")
+            self.client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+        else:
+            self.client = chromadb.PersistentClient(path=persist_directory)
+            
         self.embedding_fn = OllamaEmbeddingFunction()
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
