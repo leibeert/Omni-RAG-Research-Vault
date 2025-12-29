@@ -1,7 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse
 from typing import List, Optional
+import time
+import logging
+
+from src.schemas import QueryRequest, AnswerResponse, Source, ErrorResponse
 import uvicorn
 import json
 import ollama
@@ -11,7 +14,33 @@ from src.search import Reranker, search_and_answer
 from src.config import TOP_K_RETRIEVAL, TOP_K_RERANK
 from src.memory import ChatHistory
 
-app = FastAPI(title="Omni-RAG Research Vault", version="1.0.0")
+app = FastAPI(
+    title="Omni-RAG Research Vault",
+    description="A production-ready RAG system for researching and querying documents with citation support.",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Global Error Handler Middleware
+@app.middleware("http")
+async def global_error_handler(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logging.error(f"Global Error: {str(e)}")
+        # Check for common errors (DB, Timeout) - simplistic check
+        error_msg = str(e)
+        if "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Service Unavailable: Database or LLM connection issue."}
+            )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal Server Error: {str(e)}"}
+        )
 
 # Initialize Global Resources
 db = Database()
@@ -20,9 +49,7 @@ reranker = Reranker()
 # In prod, this would be session-based or keyed by user_id
 chat_history = ChatHistory()
 
-class QueryRequest(BaseModel):
-    query: str
-    pass
+# QueryRequest imported from src.schemas
 
 @app.on_event("startup")
 async def startup_event():
@@ -33,44 +60,48 @@ async def startup_event():
 def read_root():
     return {"status": "active", "message": "Welcome to Omni-RAG Research Vault API"}
 
-@app.post("/chat")
+@app.post("/chat", response_model=AnswerResponse, tags=["Research"])
 async def chat_endpoint(request: QueryRequest):
     """
-    Streaming chat endpoint that:
-    1. Searches (Hybrid)
-    2. Reranks
-    3. Streams response from Ollama
+    Search and Answer endpoint.
+    
+    Processing Steps:
+    1. condensed_question = process_history(query)
+    2. retrieval = vector_db.search(condensed_question)
+    3. reranking = reranker.rank(retrieval)
+    4. generation = llm.generate(prompt, context)
+    
+    Returns:
+        AnswerResponse: The answer and list of sources.
     """
     user_query = request.query
     
-    # 0. Conversation Memory - Condense Question
-    # Check if we have history
+    # 0. Conversation Memory
     query = chat_history.condense_question(user_query)
-    print(f"Original: {user_query} -> Condensed: {query}")
+    chat_history.add_user_message(user_query)
     
-    # Add user message to history
-    chat_history.add_user_message(user_query) # Store original or condensed? Usually original for display, but context matters.
-    
-    # 1. Retrieval & Reranking (Non-streaming part)
-    # We reuse the logic from search.py but we need to control the generation generation for streaming
-    
-    # Search
+    # 1. Retrieval
     results = db.search(query, n_results=TOP_K_RETRIEVAL)
     if not results['documents'] or not results['documents'][0]:
-        return {"answer": "No relevant documents found.", "sources": []}
+        return AnswerResponse(answer="No relevant documents found.", sources=[])
     
     candidates_text = results['documents'][0]
     candidates_meta = results['metadatas'][0]
     
-    # Rerank
-    top_indices = reranker.rerank(query, candidates_text, top_k=TOP_K_RERANK)
-    top_docs = [candidates_text[i] for i in top_indices]
-    top_metas = [candidates_meta[i] for i in top_indices]
+    # 2. Reranking
+    try:
+        top_indices = reranker.rerank(query, candidates_text, top_k=TOP_K_RERANK)
+        top_docs = [candidates_text[i] for i in top_indices]
+        top_metas = [candidates_meta[i] for i in top_indices]
+    except Exception as e:
+        # Fallback if reranker fails (e.g. memory issue)
+        print(f"Reranking failed: {e}. Falling back to top retrieval results.")
+        top_docs = candidates_text[:TOP_K_RERANK]
+        top_metas = candidates_meta[:TOP_K_RERANK]
     
-    # Construct Context
+    # 3. Context Construction
     context = "\n\n".join([f"Source {i+1}: {doc}" for i, doc in enumerate(top_docs)])
     
-    # Prepare Prompt
     prompt = f"""You are a research assistant. Answer the question based ONLY on the following context.
     
     Context:
@@ -80,55 +111,27 @@ async def chat_endpoint(request: QueryRequest):
     
     Answer:"""
     
-    # Sources for the client
+    # 4. Generation (Non-streaming for strict schema validation)
+    response = ollama.chat(
+        model='qwen2.5:14b',
+        messages=[{'role': 'user', 'content': prompt}],
+        stream=False,
+    )
+    
+    answer_text = response['message']['content']
+    
+    # Update history
+    chat_history.add_ai_message(answer_text)
+    
+    # 5. Response Formatting
     sources = []
     for meta in top_metas:
-        sources.append({
-            "filename": meta.get("filename", "Unknown"),
-            "page_number": meta.get("page_number", "Unknown")
-        })
+        sources.append(Source(
+            filename=meta.get("filename", "Unknown"),
+            page_number=meta.get("page_number") # Pydantic Optional[int] handles None/missing if passed correctly, but meta.get returns None by default
+        ))
 
-    # Generator for Streaming
-    def iter_response():
-        # First yield the sources headers or metadata if needed? 
-        # Usually checking streaming APIs, we send the text. 
-        # We can send a JSON structure line by line, or just raw text.
-        # For simplicity in this "Streaming" task, we'll stream the raw text of the answer.
-        # But the user requirement says "Update the final output to be a dictionary containing... sources".
-        # Streaming standard JSON is hard. 
-        # PROPOSAL: We will stream the text chunks, and maybe append sources at the end?
-        # OR: We yield a custom SSE event or JSON lines.
-        # Let's try simple text streaming for the answer, and maybe print sources first?
-        
-        # Let's send a JSON object with sources first as a separate message if possible?
-        # Or standard practice: Stream the markdown tokens.
-        # We will separate sources and answer.
-        # Since the user asked for a "dictionary containing... sources", that was for the static output.
-        # For "Streaming", usually it's text.
-        # Let's stream the text and return sources in a header? (Too rigid)
-        # Let's stick to streaming the raw answer provided by Ollama.
-        
-        stream = ollama.chat(
-            model='qwen2.5:14b',
-            messages=[{'role': 'user', 'content': prompt}],
-            stream=True,
-        )
-        
-        full_response = ""
-        for chunk in stream:
-            content = chunk['message']['content']
-            full_response += content
-            yield content
-        
-        # Update History with full response
-        chat_history.add_ai_message(full_response)
-            
-        # Optional: Append sources to the stream in markdown
-        yield "\n\n**Sources:**\n"
-        for s in sources:
-            yield f"- {s['filename']} (Page {s['page_number']})\n"
-
-    return StreamingResponse(iter_response(), media_type="text/plain")
+    return AnswerResponse(answer=answer_text, sources=sources)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
