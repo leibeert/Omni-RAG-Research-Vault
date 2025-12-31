@@ -1,0 +1,27 @@
+[
+    {
+        "question": "What is the capital of France?",
+        "expected_answer": "Paris",
+        "context_topic": "Geography"
+    },
+    {
+        "question": "What programming language is best for AI?",
+        "expected_answer": "Python",
+        "context_topic": "Programming"
+    },
+    {
+        "question": "When was the Eiffel Tower constructed?",
+        "expected_answer": "1889",
+        "context_topic": "History"
+    },
+    {
+        "question": "Define Machine Learning.",
+        "expected_answer": "A subset of artificial intelligence.",
+        "context_topic": "AI"
+    },
+    {
+        "question": "Are snakes reptiles?",
+        "expected_answer": "Yes",
+        "context_topic": "Biology"
+    }
+]
